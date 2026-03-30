@@ -1,0 +1,41 @@
+# ── Core web framework ───────────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+
+# ── DeepFace & its dependencies ───────────────────────────────────────────────
+# deepface installs TensorFlow, Keras, and several vision libraries.
+# On first run it downloads ~100 MB of pre-trained model weights from GitHub
+# and caches them in  ~/.deepface/weights/  (automatic, one-time).
+deepface>=0.0.93
+
+# ── Vision utilities ─────────────────────────────────────────────────────────
+# opencv-python-headless is the server-safe build (no Qt/GUI dependencies).
+# deepface also pulls in opencv, but pinning here ensures the headless variant.
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── LLM report generation (optional — server works without this) ──────────────
+# Google Gemini free tier — get your key at https://aistudio.google.com/apikey
+google-generativeai>=0.8.0
+
+# ── Audio transcription (optional — server works without this) ────────────────
+# openai-whisper provides local speech-to-text using OpenAI's Whisper model.
+# NOTE: ffmpeg must also be installed on the system (not via pip).
+#   Windows: winget install Gyan.FFmpeg   or   choco install ffmpeg
+#   Linux:   sudo apt install ffmpeg
+#   macOS:   brew install ffmpeg
+openai-whisper>=20231117
+
+# ── Note on TensorFlow ────────────────────────────────────────────────────────
+# deepface pulls in tensorflow automatically.
+# If you have a CUDA-capable GPU and want GPU inference, replace tensorflow
+# with tensorflow[and-cuda] in your environment AFTER installing this file:
+#
+#   pip uninstall tensorflow
+#   pip install tensorflow[and-cuda]
+#
+# CPU-only is perfectly fine for 5fps real-time inference.
