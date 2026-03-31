@@ -237,12 +237,18 @@ def _decode_frame(b64_data: str) -> Optional[np.ndarray]:
 
 # ── DeepFace inference ────────────────────────────────────────────────────────
 
-def _run_deepface(frame_bgr: np.ndarray) -> Optional[Dict[str, float]]:
+def _run_deepface(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]], float]:
     """
     Run DeepFace emotion analysis on a BGR numpy array.
 
-    Returns a dict of {emotion: 0–100 %} for the most prominent (largest)
-    face detected in the frame, or None if no face was found.
+    Returns a (scores, face_confidence) tuple:
+      - scores:          dict of {emotion: 0–100 %}, or None if no face found
+      - face_confidence:  DeepFace's detection confidence in [0, 1]
+
+    The face_confidence is analogous to MediaPipe's detection score in the
+    custom backend.  It lets the caller weight this frame's contribution to
+    the smoothing window: a marginal detection (confidence ~0.55) should
+    influence the live chart less than a clear front-on face (~0.95).
 
     Design decisions:
     ─────────────────
@@ -281,10 +287,13 @@ def _run_deepface(frame_bgr: np.ndarray) -> Optional[Dict[str, float]]:
 
         # results is always a list (one entry per detected face)
         if not results:
-            return None
+            return None, 0.0
 
         # If multiple faces detected, pick the most confident one
         best = max(results, key=lambda r: r.get("face_confidence", 0.0))
+
+        # Extract detection confidence — analogous to MediaPipe's score[0]
+        det_score: float = float(best.get("face_confidence", 1.0))
 
         # DeepFace emotion values are already in 0–100 range
         raw_emotions: dict = best["emotion"]   # e.g. {"angry": 1.2, "happy": 84.1, …}
@@ -294,35 +303,102 @@ def _run_deepface(frame_bgr: np.ndarray) -> Optional[Dict[str, float]]:
             emotion: round(float(raw_emotions.get(emotion, 0.0)), 2)
             for emotion in CLASS_NAMES
         }
-        return scores
+        return scores, det_score
 
     except ValueError:
         # "Face could not be detected." — normal when person looks away
-        return None
+        return None, 0.0
     except Exception as exc:
         # Unexpected errors (model loading failure, corrupt image, etc.)
         # Log but don't crash the WebSocket handler
         print(f"[deepface] Unexpected error during analysis: {exc}")
-        return None
+        return None, 0.0
+
+
+def _run_deepface_tta(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]], float]:
+    """
+    Run DeepFace with horizontal-flip Test-Time Augmentation (TTA).
+
+    This mirrors the TTA approach in the custom backend's _run_model_tta:
+    analyse the original frame and a horizontally flipped copy, then average
+    the emotion scores.  Because faces are roughly left–right symmetric for
+    most emotions, this reduces per-frame variance and gives more stable
+    probability estimates.
+
+    Unlike the custom backend (which batches both crops in one forward pass),
+    DeepFace requires two separate analyze() calls — one for each orientation.
+    This doubles the per-frame inference cost.  In practice the extra latency
+    is acceptable because:
+      • The semaphore already limits concurrency to 4.
+      • Even with 2× overhead the worst-case RT (~200 ms on CPU) still fits
+        within the 200 ms frame budget at 5 fps.
+      • The stability improvement materially reduces chart flicker.
+
+    Fallback: if the flipped frame fails to detect a face (e.g. asymmetric
+    occlusion), the original-only result is returned unchanged.
+
+    Returns (scores, avg_confidence) — same contract as _run_deepface.
+    """
+    scores_orig, conf_orig = _run_deepface(frame_bgr)
+    if scores_orig is None:
+        return None, 0.0
+
+    # Horizontal mirror — DeepFace will re-detect and re-align the flipped face
+    flipped = np.fliplr(frame_bgr).copy()
+    scores_flip, conf_flip = _run_deepface(flipped)
+
+    if scores_flip is None:
+        # Face not detected in the mirror — fall back to original only
+        return scores_orig, conf_orig
+
+    # Average emission scores from both orientations
+    avg_scores = {
+        name: round((scores_orig[name] + scores_flip[name]) / 2.0, 2)
+        for name in CLASS_NAMES
+    }
+    avg_conf = (conf_orig + conf_flip) / 2.0
+    return avg_scores, avg_conf
 
 
 # ── Sliding-window smoothing ──────────────────────────────────────────────────
 
-def _smooth_window(window: deque) -> Dict[str, float]:
+def _smooth_window(
+    window: deque,
+    weights: deque,
+    ema_alpha: float = 0.3,
+) -> Dict[str, float]:
     """
-    Average the emotion scores across all frames currently in the sliding window.
+    Compute smoothed emotion scores using an exponentially weighted moving average,
+    where each frame is additionally weighted by its detection confidence score.
 
-    This implements the 3-second temporal smoothing described in project.md:
-    single-frame scores are noisy (blinks, head turns, mid-expression frames);
-    averaging over 15 frames (3 s at 5 fps) produces stable, meaningful output.
+    This replaces the previous uniform box average and mirrors the custom backend's
+    improved smoothing.  Two changes make a noticeable difference in real-time use:
+
+    1. EMA (alpha=0.3): recent frames carry exponentially more weight than older
+       ones, so the chart responds faster to genuine emotion changes while still
+       smoothing out single-frame noise (blinks, micro-expressions).
+
+    2. Confidence weighting: DeepFace's face_confidence (0–1) gates each frame's
+       contribution.  A marginal detection (confidence ~0.55) counts less than a
+       crisp front-on face (~0.95), reducing chart jitter from uncertain frames.
     """
     if not window:
         return {name: 0.0 for name in CLASS_NAMES}
-    n = len(window)
-    return {
-        name: round(sum(frame[name] for frame in window) / n, 2)
-        for name in CLASS_NAMES
-    }
+
+    acc      = {name: 0.0 for name in CLASS_NAMES}
+    acc_w    = 0.0
+    momentum = 1.0 - ema_alpha
+
+    for scores, w in zip(window, weights):          # oldest → newest
+        scaled_w = ema_alpha * w
+        for name in CLASS_NAMES:
+            acc[name] = scaled_w * scores[name] + momentum * acc[name]
+        acc_w = scaled_w + momentum * acc_w
+
+    if acc_w < 1e-9:
+        return {name: 0.0 for name in CLASS_NAMES}
+
+    return {name: round(acc[name] / acc_w, 2) for name in CLASS_NAMES}
 
 
 # ── Audio transcription ─────────────────────────────────────────────────────────────
@@ -379,6 +455,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
 
     SESSIONS[session_id] = {
         "window":       deque(maxlen=WINDOW_SIZE),  # up to 15 most-recent raw score dicts
+        "det_weights":  deque(maxlen=WINDOW_SIZE),  # detection confidence per frame
         "history":      [],                          # (timestamp, dominant, smoothed) per frame
         "start":        time.monotonic(),
         "audio_chunks": [],                          # raw WebM bytes from audio_chunk messages
@@ -459,10 +536,10 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
 
     Pipeline:
         base64 string
-        → BGR numpy array        (_decode_frame)
-        → {emotion: score} dict  (_run_deepface — includes face detection + align + emotion)
-        → sliding window advance
-        → smoothed scores        (_smooth_window)
+        → BGR numpy array              (_decode_frame)
+        → {emotion: score}, confidence (_run_deepface_tta — TTA with horizontal flip)
+        → sliding window advance       (confidence-weighted EMA)
+        → smoothed scores              (_smooth_window)
         → response dict
 
     This function must NOT use await — it is called from a regular thread.
@@ -488,10 +565,9 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
             "model":         model_tag,
         }
 
-    # ── 2. Run DeepFace (face detection + emotion recognition in one call) ─────
-    raw_scores = _run_deepface(frame)
+    # ── 2. Run DeepFace with TTA (original + horizontal flip, averaged) ────────
+    raw_scores, det_score = _run_deepface_tta(frame)
     if raw_scores is None:
-        # No face detected — update the window with nothing, return no-face signal
         return {
             "type":          "result",
             "face_detected": False,
@@ -500,8 +576,10 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
         }
 
     # ── 3. Advance the sliding window and compute temporally smoothed scores ───
+    # Detection confidence gates how much this frame contributes to the EMA.
     session["window"].append(raw_scores)
-    smoothed_scores = _smooth_window(session["window"])
+    session["det_weights"].append(det_score)
+    smoothed_scores = _smooth_window(session["window"], session["det_weights"])
 
     dominant   = max(smoothed_scores, key=smoothed_scores.get)
     confidence = smoothed_scores[dominant]
