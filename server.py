@@ -110,6 +110,9 @@ from fastapi.middleware.cors import CORSMiddleware
 HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(HERE, ".env"))
 
+# ── Authentication (Google OAuth + JWT + SQLite) ────────────────────────────
+from auth import auth_router, init_db, verify_token
+
 # ── Config (overridable via .env) ─────────────────────────────────────────────
 # Detector backend used by DeepFace for face detection.
 # See module docstring for options and speed/accuracy tradeoffs.
@@ -148,6 +151,9 @@ async def lifespan(app: FastAPI):
     Warm up DeepFace and optionally load Whisper on startup.
     """
     global DEEPFACE_READY, _INFERENCE_SEM, WHISPER_MODEL
+
+    # ── Initialise authentication database ────────────────────────────────────
+    init_db()
 
     _INFERENCE_SEM = asyncio.Semaphore(4)
 
@@ -190,6 +196,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
 
 
 def _warmup_deepface() -> bool:
@@ -451,6 +459,18 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
       • Receives a single "end" message when the video/recording finishes
       • Generates and sends a session summary report, then closes cleanly
     """
+    # ── Authenticate via query-string token ────────────────────────────────
+    token = websocket.query_params.get("token")
+    user_payload = verify_token(token) if token else None
+    if not user_payload:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({
+            "type": "auth_error",
+            "message": "Authentication required. Please log in first.",
+        }))
+        await websocket.close(code=4001)
+        return
+
     await websocket.accept()
 
     SESSIONS[session_id] = {
