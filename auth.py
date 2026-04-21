@@ -1,8 +1,8 @@
 """
-auth.py — Authentication module with Google OAuth 2.0, email/password, JWT tokens, and SQLite.
+auth.py — Authentication module with Google OAuth 2.0, email/password, JWT tokens, and MongoDB.
 
 Provides:
-  - SQLite user database  (file-based — no external service needed)
+  - MongoDB user database (Atlas cloud or local instance)
   - Google OAuth 2.0 login flow
   - Email + password registration and login (bcrypt hashed)
   - JWT token creation and verification
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
@@ -31,11 +30,12 @@ from urllib.parse import urlencode
 import bcrypt
 import httpx
 import jwt
+from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-
-HERE = os.path.dirname(os.path.abspath(__file__))
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 # ── Configuration (read from environment / .env) ────────────────────────────
 GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -43,13 +43,18 @@ GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
 JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "")
 FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:8080")
 
+# MongoDB connection string (must be provided via .env / environment)
+MONGODB_URI: str = os.getenv("MONGODB_URI", "").strip()
+MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "emotiontrack")
+
 # Google OAuth endpoints
 _GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 _GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
-# SQLite database — one file next to this module
-DB_PATH = os.path.join(HERE, "auth.db")
+# MongoDB client and collection (initialized in init_db)
+_mongo_client: Optional[MongoClient] = None
+_users_collection = None
 
 # JWT lifetime: 7 days
 _JWT_EXPIRY_SECONDS = 7 * 24 * 3600
@@ -76,56 +81,59 @@ class LoginRequest(BaseModel):
 
 # ── Database ─────────────────────────────────────────────────────────────────
 
-_NEW_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    email           TEXT    UNIQUE NOT NULL,
-    name            TEXT    NOT NULL DEFAULT '',
-    picture         TEXT    NOT NULL DEFAULT '',
-    password_hash   TEXT,
-    google_id       TEXT    UNIQUE,
-    auth_provider   TEXT    NOT NULL DEFAULT 'email',
-    created_at      REAL    NOT NULL,
-    last_login      REAL    NOT NULL
-)
-"""
-
-
 def init_db() -> None:
-    """Create or migrate the users table."""
-    conn = sqlite3.connect(DB_PATH)
+    """Connect to MongoDB and ensure indexes exist."""
+    global _mongo_client, _users_collection
 
-    # Check if table exists
-    table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
-    ).fetchone()
-
-    if not table_exists:
-        conn.execute(_NEW_SCHEMA)
-        conn.commit()
-        conn.close()
-        print("[auth] SQLite database ready (new schema).")
-        return
-
-    # Check if migration is needed (old schema lacks password_hash column)
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-    if "password_hash" not in columns:
-        print("[auth] Migrating database to new schema (adding email/password support)...")
-        conn.execute("ALTER TABLE users RENAME TO _users_old")
-        conn.execute(_NEW_SCHEMA)
-        conn.execute(
-            """
-            INSERT INTO users (id, email, name, picture, google_id, auth_provider, created_at, last_login)
-            SELECT id, email, name, picture, google_id, 'google', created_at, last_login
-            FROM _users_old
-            """
+    if not MONGODB_URI:
+        raise RuntimeError(
+            "MONGODB_URI is not configured. Set it in .env or as an environment variable."
         )
-        conn.execute("DROP TABLE _users_old")
-        conn.commit()
-        print("[auth] Migration complete.")
 
-    conn.close()
-    print("[auth] SQLite database ready.")
+    print(f"[auth] Connecting to MongoDB...")
+    _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    # Fail fast if MongoDB is unreachable instead of surfacing errors later.
+    _mongo_client.admin.command("ping")
+    db = _mongo_client[MONGODB_DB_NAME]
+    _users_collection = db["users"]
+
+    # Legacy cleanup: remove explicit null google_id values from older writes.
+    # This prevents duplicate-key collisions on unique google_id indexes.
+    _users_collection.update_many({"google_id": None}, {"$unset": {"google_id": ""}})
+
+    # Create indexes (idempotent — safe to call multiple times).
+    _users_collection.create_index("email", unique=True)
+
+    # Replace legacy sparse index with a partial index that only applies to
+    # string google_id values. This allows many email-only users (no google_id).
+    try:
+        _users_collection.drop_index("google_id_1")
+    except OperationFailure:
+        pass
+    _users_collection.create_index(
+        "google_id",
+        unique=True,
+        partialFilterExpression={"google_id": {"$type": "string"}},
+    )
+
+    print(f"[auth] MongoDB connected — database: {MONGODB_DB_NAME}, collection: users")
+
+
+def _user_doc_to_dict(doc: dict) -> Dict[str, Any]:
+    """Convert a MongoDB document to a user dict with string id."""
+    if doc is None:
+        return None
+    return {
+        "id": str(doc["_id"]),
+        "email": doc.get("email", ""),
+        "name": doc.get("name", ""),
+        "picture": doc.get("picture", ""),
+        "password_hash": doc.get("password_hash"),
+        "google_id": doc.get("google_id"),
+        "auth_provider": doc.get("auth_provider", "email"),
+        "created_at": doc.get("created_at", 0),
+        "last_login": doc.get("last_login", 0),
+    }
 
 
 # ── Password helpers ──────────────────────────────────────────────────────────
@@ -146,111 +154,112 @@ def _get_or_create_google_user(
     google_id: str, email: str, name: str, picture: str
 ) -> Dict[str, Any]:
     """Find or create a user from Google OAuth. Links accounts if email exists."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
     now = time.time()
 
     # Check if user exists by google_id
-    row = conn.execute(
-        "SELECT * FROM users WHERE google_id = ?", (google_id,)
-    ).fetchone()
+    doc = _users_collection.find_one({"google_id": google_id})
 
-    if row:
-        # Existing Google user — update profile
-        conn.execute(
-            "UPDATE users SET last_login = ?, name = ?, picture = ? WHERE google_id = ?",
-            (now, name, picture, google_id),
+    if doc:
+        # Existing Google user — update profile and last_login
+        _users_collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"last_login": now, "name": name, "picture": picture}}
         )
-    else:
-        # Check if an email-only account exists — link it
-        row = conn.execute(
-            "SELECT * FROM users WHERE email = ?", (email,)
-        ).fetchone()
+        doc = _users_collection.find_one({"_id": doc["_id"]})
+        return _user_doc_to_dict(doc)
 
-        if row:
-            # Link Google to existing email account
-            conn.execute(
-                "UPDATE users SET google_id = ?, name = ?, picture = ?, auth_provider = 'both', last_login = ? WHERE email = ?",
-                (google_id, name, picture, now, email),
-            )
-        else:
-            # Brand new user via Google
-            conn.execute(
-                "INSERT INTO users (email, name, picture, google_id, auth_provider, created_at, last_login) "
-                "VALUES (?, ?, ?, ?, 'google', ?, ?)",
-                (email, name, picture, google_id, now, now),
-            )
-    conn.commit()
+    # Check if an email-only account exists — link it
+    doc = _users_collection.find_one({"email": email})
 
-    row = conn.execute(
-        "SELECT * FROM users WHERE email = ?", (email,)
-    ).fetchone()
-    user = dict(row)
-    conn.close()
-    return user
+    if doc:
+        # Link Google to existing email account
+        _users_collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {
+                "google_id": google_id,
+                "name": name,
+                "picture": picture,
+                "auth_provider": "both",
+                "last_login": now
+            }}
+        )
+        doc = _users_collection.find_one({"_id": doc["_id"]})
+        return _user_doc_to_dict(doc)
+
+    # Brand new user via Google
+    new_user = {
+        "email": email,
+        "name": name,
+        "picture": picture,
+        "password_hash": None,
+        "google_id": google_id,
+        "auth_provider": "google",
+        "created_at": now,
+        "last_login": now,
+    }
+    result = _users_collection.insert_one(new_user)
+    doc = _users_collection.find_one({"_id": result.inserted_id})
+    return _user_doc_to_dict(doc)
 
 
 def _create_email_user(email: str, name: str, password: str) -> Dict[str, Any]:
     """Create a new user with email + password. Raises on duplicate email."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
     now = time.time()
-
-    # Check if email is already taken
-    existing = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    if existing:
-        conn.close()
-        raise ValueError("email_taken")
-
     password_hash = _hash_password(password)
-    conn.execute(
-        "INSERT INTO users (email, name, password_hash, auth_provider, created_at, last_login) "
-        "VALUES (?, ?, ?, 'email', ?, ?)",
-        (email, name, password_hash, now, now),
-    )
-    conn.commit()
 
-    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    user = dict(row)
-    conn.close()
-    return user
+    new_user = {
+        "email": email,
+        "name": name,
+        "picture": "",
+        "password_hash": password_hash,
+        "auth_provider": "email",
+        "created_at": now,
+        "last_login": now,
+    }
+
+    try:
+        result = _users_collection.insert_one(new_user)
+    except DuplicateKeyError as exc:
+        details = getattr(exc, "details", {}) or {}
+        key_pattern = details.get("keyPattern", {})
+        if "email" in key_pattern or "email" in str(exc):
+            raise ValueError("email_taken")
+        raise
+
+    doc = _users_collection.find_one({"_id": result.inserted_id})
+    return _user_doc_to_dict(doc)
 
 
 def _verify_email_login(email: str, password: str) -> Optional[Dict[str, Any]]:
     """Verify email + password. Returns user dict or None."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    doc = _users_collection.find_one({"email": email})
 
-    row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-    if not row:
-        conn.close()
+    if not doc:
         return None
-
-    user = dict(row)
-    conn.close()
 
     # User exists but signed up with Google only (no password set)
-    if not user.get("password_hash"):
+    if not doc.get("password_hash"):
         return None
 
-    if not _verify_password(password, user["password_hash"]):
+    if not _verify_password(password, doc["password_hash"]):
         return None
 
     # Update last_login
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (time.time(), user["id"]))
-    conn.commit()
-    conn.close()
+    _users_collection.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"last_login": time.time()}}
+    )
 
-    return user
+    doc = _users_collection.find_one({"_id": doc["_id"]})
+    return _user_doc_to_dict(doc)
 
 
 # ── JWT helpers ──────────────────────────────────────────────────────────────
 
-def create_token(user_id: int, email: str, name: str) -> str:
+def create_token(user_id: str, email: str, name: str) -> str:
     """Create a signed JWT for the given user."""
     payload = {
-        "sub": str(user_id),
+        "sub": user_id,  # Already a string (MongoDB ObjectId converted)
         "email": email,
         "name": name,
         "iat": time.time(),
@@ -277,11 +286,13 @@ def get_user_from_token(token: str) -> Optional[Dict[str, Any]]:
     user_id = payload.get("sub")
     if not user_id:
         return None
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (int(user_id),)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+
+    try:
+        doc = _users_collection.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        return None
+
+    return _user_doc_to_dict(doc) if doc else None
 
 
 # ── FastAPI Router ───────────────────────────────────────────────────────────

@@ -110,8 +110,8 @@ from fastapi.middleware.cors import CORSMiddleware
 HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(HERE, ".env"))
 
-# ── Authentication (Google OAuth + JWT + SQLite) ────────────────────────────
-from auth import auth_router, init_db, verify_token
+# ── Authentication (Google OAuth + JWT + MongoDB) ───────────────────────────
+from auth import auth_router, get_user_from_token, init_db
 
 # ── Config (overridable via .env) ─────────────────────────────────────────────
 # Detector backend used by DeepFace for face detection.
@@ -461,8 +461,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     """
     # ── Authenticate via query-string token ────────────────────────────────
     token = websocket.query_params.get("token")
-    user_payload = verify_token(token) if token else None
-    if not user_payload:
+    user = get_user_from_token(token) if token else None
+    if not user:
         await websocket.accept()
         await websocket.send_text(json.dumps({
             "type": "auth_error",
