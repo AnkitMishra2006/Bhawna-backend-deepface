@@ -55,6 +55,7 @@ _GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 # MongoDB client and collection (initialized in init_db)
 _mongo_client: Optional[MongoClient] = None
 _users_collection = None
+_analysis_collection = None
 
 # JWT lifetime: 7 days
 _JWT_EXPIRY_SECONDS = 7 * 24 * 3600
@@ -83,7 +84,7 @@ class LoginRequest(BaseModel):
 
 def init_db() -> None:
     """Connect to MongoDB and ensure indexes exist."""
-    global _mongo_client, _users_collection
+    global _mongo_client, _users_collection, _analysis_collection
 
     if not MONGODB_URI:
         raise RuntimeError(
@@ -96,6 +97,7 @@ def init_db() -> None:
     _mongo_client.admin.command("ping")
     db = _mongo_client[MONGODB_DB_NAME]
     _users_collection = db["users"]
+    _analysis_collection = db["analysis_reports"]
 
     # Legacy cleanup: remove explicit null google_id values from older writes.
     # This prevents duplicate-key collisions on unique google_id indexes.
@@ -116,7 +118,18 @@ def init_db() -> None:
         partialFilterExpression={"google_id": {"$type": "string"}},
     )
 
+    # Report/history storage for completed analysis sessions.
+    _analysis_collection.create_index([("user_id", 1), ("created_at", -1)])
+    _analysis_collection.create_index([("session_id", 1), ("backend", 1)])
+
     print(f"[auth] MongoDB connected — database: {MONGODB_DB_NAME}, collection: users")
+
+
+def get_analysis_collection():
+    """Return the MongoDB collection used for persisted analysis reports."""
+    if _analysis_collection is None:
+        raise RuntimeError("Database is not initialized. Call init_db() first.")
+    return _analysis_collection
 
 
 def _user_doc_to_dict(doc: dict) -> Dict[str, Any]:

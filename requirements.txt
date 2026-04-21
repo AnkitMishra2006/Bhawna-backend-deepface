@@ -8,6 +8,7 @@ websockets>=12.0
 # On first run it downloads ~100 MB of pre-trained model weights from GitHub
 # and caches them in  ~/.deepface/weights/  (automatic, one-time).
 deepface>=0.0.93
+tf-keras>=2.15.0
 
 # ── Vision utilities ─────────────────────────────────────────────────────────
 # opencv-python-headless is the server-safe build (no Qt/GUI dependencies).

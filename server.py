@@ -101,9 +101,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from bson import ObjectId
 from deepface import DeepFace
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Environment ──────────────────────────────────────────────────────────────
@@ -111,7 +112,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(HERE, ".env"))
 
 # ── Authentication (Google OAuth + JWT + MongoDB) ───────────────────────────
-from auth import auth_router, get_user_from_token, init_db
+from auth import auth_router, get_analysis_collection, get_user_from_token, init_db
 
 # ── Config (overridable via .env) ─────────────────────────────────────────────
 # Detector backend used by DeepFace for face detection.
@@ -133,6 +134,103 @@ SESSIONS: Dict[str, dict] = {}
 # Sliding window size: 15 frames ≈ 3 seconds at 5 fps (per project spec)
 WINDOW_SIZE: int = 15
 
+DEFAULT_REPORT_CONTEXT_KEY = "general"
+REPORT_CONTEXT_PRESETS: Dict[str, Dict[str, str]] = {
+    "general": {
+        "label": "General emotional snapshot",
+        "focus_prompt": "Provide a balanced reading of emotional flow, transitions, and stability.",
+        "template_hint": "Use a broad and neutral interpretation of the emotional timeline.",
+        "default_objective": "Understand the overall emotional trajectory and key shifts.",
+        "safety_note": "Keep the interpretation observational and non-judgmental.",
+    },
+    "candidate_interview": {
+        "label": "Candidate interview review",
+        "focus_prompt": "Prioritise confidence, stress regulation, recovery after hard questions, and communication composure.",
+        "template_hint": "Frame insights as interview-readiness signals and coaching opportunities.",
+        "default_objective": "Assess interview confidence and pressure handling.",
+        "safety_note": "Avoid hiring recommendations; focus on behavioral observation.",
+    },
+    "education": {
+        "label": "Teaching and learning",
+        "focus_prompt": "Focus on engagement rhythm, confusion windows, and signs of sustained attention.",
+        "template_hint": "Highlight moments that may correspond to comprehension or cognitive overload.",
+        "default_objective": "Measure engagement and identify confusing moments.",
+        "safety_note": "Do not infer intelligence or capability from expressions.",
+    },
+    "customer_support": {
+        "label": "Customer support QA",
+        "focus_prompt": "Analyse empathy signals, calmness under friction, and de-escalation consistency.",
+        "template_hint": "Frame feedback around service quality and emotional resilience.",
+        "default_objective": "Evaluate empathy and emotional control during difficult interactions.",
+        "safety_note": "Avoid personal judgments and stick to observable patterns.",
+    },
+    "sales_pitch": {
+        "label": "Sales or persuasion",
+        "focus_prompt": "Assess conviction, emotional energy, trust-building windows, and momentum drop-offs.",
+        "template_hint": "Interpret shifts in emotional intensity as persuasion-strength clues.",
+        "default_objective": "Improve persuasive confidence and trust-building moments.",
+        "safety_note": "Do not claim conversion outcomes from emotion data alone.",
+    },
+    "public_speaking": {
+        "label": "Public speaking coaching",
+        "focus_prompt": "Map stage confidence arc, anxiety regulation, and audience-facing presence.",
+        "template_hint": "Translate emotional transitions into speaking-coaching cues.",
+        "default_objective": "Coach confidence and steady stage presence.",
+        "safety_note": "Keep guidance constructive and non-clinical.",
+    },
+    "content_creation": {
+        "label": "Creator performance",
+        "focus_prompt": "Evaluate camera authenticity, emotional pacing, and perceived engagement pull.",
+        "template_hint": "Connect the timeline to creator presence and likely audience resonance.",
+        "default_objective": "Improve camera presence and emotional pacing.",
+        "safety_note": "Avoid claims about audience metrics without supporting data.",
+    },
+    "ux_research": {
+        "label": "UX research session",
+        "focus_prompt": "Emphasise friction signals, confusion clusters, and delight windows tied to interaction flow.",
+        "template_hint": "Present emotion changes as product-experience evidence.",
+        "default_objective": "Identify UX friction points and positive interaction moments.",
+        "safety_note": "Treat this as directional evidence, not conclusive usability proof.",
+    },
+    "therapy_coaching": {
+        "label": "Wellbeing coaching",
+        "focus_prompt": "Offer reflective emotional insights in supportive language while avoiding diagnosis.",
+        "template_hint": "Focus on self-awareness and practical emotional regulation reflection.",
+        "default_objective": "Support reflective self-awareness in a non-clinical context.",
+        "safety_note": "Never provide clinical diagnosis or treatment advice.",
+    },
+    "medical_observation": {
+        "label": "Clinical observation",
+        "focus_prompt": "Produce a structured observational summary suitable for clinician review.",
+        "template_hint": "Use clear observational language and avoid diagnostic conclusions.",
+        "default_objective": "Create structured observational notes for clinical review.",
+        "safety_note": "This output is observational only and is not a diagnosis.",
+    },
+}
+
+
+def _normalise_report_context(raw_context: Any) -> Dict[str, str]:
+    """Coerce arbitrary client payload into a safe, known report context shape."""
+    payload = raw_context if isinstance(raw_context, dict) else {}
+
+    requested_key = str(payload.get("key", "")).strip().lower()
+    key = requested_key if requested_key in REPORT_CONTEXT_PRESETS else DEFAULT_REPORT_CONTEXT_KEY
+    preset = REPORT_CONTEXT_PRESETS[key]
+
+    label = str(payload.get("label") or preset["label"]).strip() or preset["label"]
+    objective = str(payload.get("objective") or "").strip() or preset["default_objective"]
+    extra_notes = str(payload.get("extra_notes") or "").strip()
+
+    return {
+        "key": key,
+        "label": label,
+        "objective": objective,
+        "extra_notes": extra_notes,
+        "focus_prompt": preset["focus_prompt"],
+        "template_hint": preset["template_hint"],
+        "safety_note": preset["safety_note"],
+    }
+
 # Asyncio semaphore — allows at most N concurrent DeepFace inference calls.
 # TF2 eager mode is generally thread-safe for inference, but a semaphore of 4
 # prevents overloading the CPU with many simultaneous heavy operations while
@@ -141,6 +239,7 @@ _INFERENCE_SEM: Optional[asyncio.Semaphore] = None  # initialised in lifespan
 
 # Whisper speech-to-text model (loaded at startup, None if disabled)
 WHISPER_MODEL: Optional[Any] = None
+ANALYSIS_COLLECTION: Optional[Any] = None
 
 
 # ── Lifespan events ──────────────────────────────────────────────────────────
@@ -150,10 +249,16 @@ async def lifespan(app: FastAPI):
     """
     Warm up DeepFace and optionally load Whisper on startup.
     """
-    global DEEPFACE_READY, _INFERENCE_SEM, WHISPER_MODEL
+    global DEEPFACE_READY, _INFERENCE_SEM, WHISPER_MODEL, ANALYSIS_COLLECTION
 
     # ── Initialise authentication database ────────────────────────────────────
     init_db()
+    try:
+        ANALYSIS_COLLECTION = get_analysis_collection()
+        print("[startup] Analysis collection ready.")
+    except Exception as exc:
+        ANALYSIS_COLLECTION = None
+        print(f"[startup] WARNING: analysis collection unavailable ({exc})")
 
     _INFERENCE_SEM = asyncio.Semaphore(4)
 
@@ -245,7 +350,9 @@ def _decode_frame(b64_data: str) -> Optional[np.ndarray]:
 
 # ── DeepFace inference ────────────────────────────────────────────────────────
 
-def _run_deepface(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]], float]:
+def _run_deepface(
+    frame_bgr: np.ndarray,
+) -> Tuple[Optional[Dict[str, float]], float, Optional[Dict[str, float]]]:
     """
     Run DeepFace emotion analysis on a BGR numpy array.
 
@@ -295,13 +402,36 @@ def _run_deepface(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]], fl
 
         # results is always a list (one entry per detected face)
         if not results:
-            return None, 0.0
+            return None, 0.0, None
 
         # If multiple faces detected, pick the most confident one
         best = max(results, key=lambda r: r.get("face_confidence", 0.0))
 
         # Extract detection confidence — analogous to MediaPipe's score[0]
         det_score: float = float(best.get("face_confidence", 1.0))
+
+        face_box: Optional[Dict[str, float]] = None
+        region = best.get("region") or {}
+        try:
+            rx = float(region.get("x", 0.0))
+            ry = float(region.get("y", 0.0))
+            rw = float(region.get("w", 0.0))
+            rh = float(region.get("h", 0.0))
+            if rw > 0 and rh > 0:
+                frame_h, frame_w = frame_bgr.shape[:2]
+                x0 = max(0.0, min(rx, float(frame_w)))
+                y0 = max(0.0, min(ry, float(frame_h)))
+                x1 = max(0.0, min(rx + rw, float(frame_w)))
+                y1 = max(0.0, min(ry + rh, float(frame_h)))
+                if x1 > x0 and y1 > y0:
+                    face_box = {
+                        "x": round(x0 / max(frame_w, 1), 6),
+                        "y": round(y0 / max(frame_h, 1), 6),
+                        "width": round((x1 - x0) / max(frame_w, 1), 6),
+                        "height": round((y1 - y0) / max(frame_h, 1), 6),
+                    }
+        except Exception:
+            face_box = None
 
         # DeepFace emotion values are already in 0–100 range
         raw_emotions: dict = best["emotion"]   # e.g. {"angry": 1.2, "happy": 84.1, …}
@@ -311,19 +441,21 @@ def _run_deepface(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]], fl
             emotion: round(float(raw_emotions.get(emotion, 0.0)), 2)
             for emotion in CLASS_NAMES
         }
-        return scores, det_score
+        return scores, det_score, face_box
 
     except ValueError:
         # "Face could not be detected." — normal when person looks away
-        return None, 0.0
+        return None, 0.0, None
     except Exception as exc:
         # Unexpected errors (model loading failure, corrupt image, etc.)
         # Log but don't crash the WebSocket handler
         print(f"[deepface] Unexpected error during analysis: {exc}")
-        return None, 0.0
+        return None, 0.0, None
 
 
-def _run_deepface_tta(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]], float]:
+def _run_deepface_tta(
+    frame_bgr: np.ndarray,
+) -> Tuple[Optional[Dict[str, float]], float, Optional[Dict[str, float]]]:
     """
     Run DeepFace with horizontal-flip Test-Time Augmentation (TTA).
 
@@ -347,17 +479,17 @@ def _run_deepface_tta(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]]
 
     Returns (scores, avg_confidence) — same contract as _run_deepface.
     """
-    scores_orig, conf_orig = _run_deepface(frame_bgr)
+    scores_orig, conf_orig, box_orig = _run_deepface(frame_bgr)
     if scores_orig is None:
-        return None, 0.0
+        return None, 0.0, None
 
     # Horizontal mirror — DeepFace will re-detect and re-align the flipped face
     flipped = np.fliplr(frame_bgr).copy()
-    scores_flip, conf_flip = _run_deepface(flipped)
+    scores_flip, conf_flip, _ = _run_deepface(flipped)
 
     if scores_flip is None:
         # Face not detected in the mirror — fall back to original only
-        return scores_orig, conf_orig
+        return scores_orig, conf_orig, box_orig
 
     # Average emission scores from both orientations
     avg_scores = {
@@ -365,7 +497,7 @@ def _run_deepface_tta(frame_bgr: np.ndarray) -> Tuple[Optional[Dict[str, float]]
         for name in CLASS_NAMES
     }
     avg_conf = (conf_orig + conf_flip) / 2.0
-    return avg_scores, avg_conf
+    return avg_scores, avg_conf, box_orig
 
 
 # ── Sliding-window smoothing ──────────────────────────────────────────────────
@@ -449,6 +581,107 @@ def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
             except OSError:
                 pass
 
+
+def _emotion_distribution_from_history(history: List[Tuple]) -> Dict[str, float]:
+    """Convert dominant-emotion counts to percentages for report summaries."""
+    if not history:
+        return {name: 0.0 for name in CLASS_NAMES}
+
+    counts = {name: 0 for name in CLASS_NAMES}
+    for _, dominant, _ in history:
+        counts[dominant] += 1
+
+    total = len(history)
+    return {name: round(count / total * 100, 2) for name, count in counts.items()}
+
+
+def _serialise_analysis_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Mongo document fields into JSON-safe response payload."""
+    return {
+        "id": str(doc.get("_id")),
+        "session_id": doc.get("session_id"),
+        "backend": doc.get("backend"),
+        "user": {
+            "id": doc.get("user_id"),
+            "email": doc.get("user_email"),
+            "name": doc.get("user_name"),
+        },
+        "created_at": doc.get("created_at"),
+        "ended_at": doc.get("ended_at"),
+        "duration_seconds": doc.get("duration_seconds", 0.0),
+        "total_frames": doc.get("total_frames", 0),
+        "detected_frames": doc.get("detected_frames", 0),
+        "face_detection_rate": doc.get("face_detection_rate", 0.0),
+        "emotion_distribution": doc.get("emotion_distribution", {}),
+        "timeline": doc.get("timeline", []),
+        "transcript": doc.get("transcript"),
+        "report_text": doc.get("report_text", ""),
+        "report_context": doc.get("report_context"),
+    }
+
+
+def _extract_user_from_request(request: Request) -> Optional[Dict[str, Any]]:
+    """Parse bearer token and return authenticated user payload."""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    return get_user_from_token(token)
+
+
+def _persist_analysis_sync(
+    session_id: str,
+    session: Dict[str, Any],
+    user: Dict[str, Any],
+    transcript: Optional[str],
+    report_text: str,
+) -> Optional[str]:
+    """Write completed session metrics/report to MongoDB; returns inserted id."""
+    if ANALYSIS_COLLECTION is None:
+        return None
+
+    history: List[Tuple] = session.get("history", [])
+    frame_events: List[Dict[str, Any]] = session.get("frame_events", [])
+
+    if history:
+        duration = max(0.0, float(history[-1][0]) - float(history[0][0]))
+    elif frame_events:
+        duration = max(0.0, float(frame_events[-1].get("timestamp", 0.0)))
+    else:
+        duration = 0.0
+
+    detected_frames = len(history)
+    total_frames = len(frame_events)
+    detection_rate = round((detected_frames / total_frames) * 100, 2) if total_frames else 0.0
+
+    doc = {
+        "session_id": session_id,
+        "backend": "deepface",
+        "user_id": user.get("id"),
+        "user_email": user.get("email"),
+        "user_name": user.get("name"),
+        "created_at": float(session.get("created_at", time.time())),
+        "ended_at": time.time(),
+        "duration_seconds": round(duration, 3),
+        "total_frames": total_frames,
+        "detected_frames": detected_frames,
+        "face_detection_rate": detection_rate,
+        "emotion_distribution": _emotion_distribution_from_history(history),
+        "timeline": frame_events,
+        "transcript": transcript,
+        "report_text": report_text,
+        "report_context": session.get("report_context"),
+    }
+
+    try:
+        result = ANALYSIS_COLLECTION.insert_one(doc)
+        return str(result.inserted_id)
+    except Exception as exc:
+        print(f"[db] Failed to persist analysis for {session_id}: {exc}")
+        return None
+
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     """
@@ -477,8 +710,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         "window":       deque(maxlen=WINDOW_SIZE),  # up to 15 most-recent raw score dicts
         "det_weights":  deque(maxlen=WINDOW_SIZE),  # detection confidence per frame
         "history":      [],                          # (timestamp, dominant, smoothed) per frame
+        "frame_events": [],                          # full frame timeline for DB report
         "start":        time.monotonic(),
         "audio_chunks": [],                          # raw WebM bytes from audio_chunk messages
+        "created_at":   time.time(),
+        "backend":      "deepface",
+        "report_context": _normalise_report_context(None),
+        "user":         user,
     }
     session = SESSIONS[session_id]
 
@@ -523,16 +761,54 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                         pass   # silently discard corrupt chunks
 
             elif msg_type == "end":
+                session["report_context"] = _normalise_report_context(
+                    msg.get("report_context")
+                )
                 loop = asyncio.get_running_loop()
+                audio_chunks: List[bytes] = session["audio_chunks"]
+                chunk_count = len(audio_chunks)
+                chunk_bytes = sum(len(chunk) for chunk in audio_chunks)
+                print(
+                    f"[{session_id}] Audio chunks received: {chunk_count}, "
+                    f"total bytes: {chunk_bytes}"
+                )
                 transcript = await loop.run_in_executor(
-                    None, _transcribe_audio, session["audio_chunks"]
+                    None, _transcribe_audio, audio_chunks
                 )
                 if transcript:
                     print(f"[{session_id}] Transcript ({len(transcript)} chars): "
                           f"{transcript[:80]}{'...' if len(transcript) > 80 else ''}")
-                report_text = await _generate_report(session, transcript)
+                else:
+                    print(
+                        f"[{session_id}] Transcript unavailable "
+                        f"(whisper_loaded={WHISPER_MODEL is not None}, "
+                        f"audio_chunks={chunk_count})"
+                    )
+                report_text = await _generate_report(
+                    session,
+                    transcript,
+                    session.get("report_context"),
+                )
+                analysis_id: Optional[str] = await loop.run_in_executor(
+                    None,
+                    _persist_analysis_sync,
+                    session_id,
+                    session,
+                    user,
+                    transcript,
+                    report_text,
+                )
                 await websocket.send_text(
-                    json.dumps({"type": "report", "text": report_text})
+                    json.dumps(
+                        {
+                            "type": "report",
+                            "text": report_text,
+                            "analysis_id": analysis_id,
+                            "session_id": session_id,
+                            "backend": "deepface",
+                            "report_context": session.get("report_context"),
+                        }
+                    )
                 )
                 break   # close connection gracefully after report is sent
 
@@ -566,6 +842,7 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
     """
     timestamp: float = float(msg.get("timestamp", 0.0))
     model_tag: str   = "deepface"
+    frame_index = len(session.get("frame_events", []))
 
     if not DEEPFACE_READY:
         return {
@@ -578,6 +855,13 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
     # ── 1. Decode the incoming base64 frame ───────────────────────────────────
     frame = _decode_frame(msg.get("data", ""))
     if frame is None:
+        session["frame_events"].append(
+            {
+                "frame_index": frame_index,
+                "timestamp": timestamp,
+                "face_detected": False,
+            }
+        )
         return {
             "type":          "result",
             "face_detected": False,
@@ -586,8 +870,15 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
         }
 
     # ── 2. Run DeepFace with TTA (original + horizontal flip, averaged) ────────
-    raw_scores, det_score = _run_deepface_tta(frame)
+    raw_scores, det_score, face_box = _run_deepface_tta(frame)
     if raw_scores is None:
+        session["frame_events"].append(
+            {
+                "frame_index": frame_index,
+                "timestamp": timestamp,
+                "face_detected": False,
+            }
+        )
         return {
             "type":          "result",
             "face_detected": False,
@@ -606,6 +897,19 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
 
     # ── 4. Append to session history for end-of-session report ────────────────
     session["history"].append((timestamp, dominant, dict(smoothed_scores)))
+    session["frame_events"].append(
+        {
+            "frame_index": frame_index,
+            "timestamp": timestamp,
+            "face_detected": True,
+            "dominant_emotion": dominant,
+            "confidence": confidence,
+            "raw_scores": raw_scores,
+            "smoothed_scores": smoothed_scores,
+            "face_box": face_box,
+            "detection_confidence": round(det_score, 4),
+        }
+    )
 
     return {
         "type":             "result",
@@ -614,6 +918,7 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
         "smoothed_scores":  smoothed_scores,
         "dominant_emotion": dominant,
         "confidence":       confidence,
+        "face_box":         face_box,
         "timestamp":        timestamp,
         "model":            model_tag,
     }
@@ -621,7 +926,11 @@ def _process_frame_sync(msg: dict, session: dict) -> dict:
 
 # ── Report generation ─────────────────────────────────────────────────────────
 
-async def _generate_report(session: dict, transcript: Optional[str] = None) -> str:
+async def _generate_report(
+    session: dict,
+    transcript: Optional[str] = None,
+    report_context: Optional[Dict[str, str]] = None,
+) -> str:
     """
     Build an end-of-session emotional summary.
 
@@ -630,6 +939,7 @@ async def _generate_report(session: dict, transcript: Optional[str] = None) -> s
     detailed and human-readable — and works with zero API keys.
     """
     history: List[Tuple] = session["history"]
+    context = report_context or _normalise_report_context(session.get("report_context"))
 
     if not history:
         return "No emotion data was captured during this session."
@@ -651,13 +961,27 @@ async def _generate_report(session: dict, transcript: Optional[str] = None) -> s
     api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         try:
-            llm_text = await _llm_report(history, emotion_pct, duration, api_key, transcript)
+            llm_text = await _llm_report(
+                history,
+                emotion_pct,
+                duration,
+                api_key,
+                transcript,
+                context,
+            )
             if llm_text:
                 return llm_text
         except Exception as exc:
             print(f"[report] LLM call failed ({exc}). Falling back to template.")
 
-    return _template_report(duration, sorted_emotions, dominant_overall, history, transcript)
+    return _template_report(
+        duration,
+        sorted_emotions,
+        dominant_overall,
+        history,
+        transcript,
+        context,
+    )
 
 
 async def _llm_report(
@@ -666,6 +990,7 @@ async def _llm_report(
     duration:    float,
     api_key:     str,
     transcript:  Optional[str] = None,
+    report_context: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """
     Call Google Gemini to generate a natural-language session report.
@@ -703,6 +1028,16 @@ async def _llm_report(
         if transcript else ""
     )
 
+    context = report_context or _normalise_report_context(None)
+    context_block = (
+        f"\n\nReport lens: {context['label']}\n"
+        f"Primary objective: {context['objective']}\n"
+        f"Lens guidance: {context['focus_prompt']}\n"
+        f"Safety note: {context['safety_note']}"
+    )
+    if context.get("extra_notes"):
+        context_block += f"\nAdditional analyst notes: {context['extra_notes']}"
+
     prompt = (
         f"You are analysing facial emotion data captured from a video session using "
         f"the DeepFace library's pre-trained emotion recognition model.\n\n"
@@ -710,9 +1045,12 @@ async def _llm_report(
         f"Frames analysed   : {n}\n\n"
         f"Emotion distribution (% of frames where each emotion was dominant):\n{dist_block}\n\n"
         f"Emotional timeline (sampled every ~{step} frames):\n{timeline}"
-        f"{transcript_block}\n\n"
-        "Write a concise 2–3 paragraph report describing the person's emotional journey. "
-        "Cover which emotions dominated, any notable transitions, and an overall characterisation."
+        f"{transcript_block}"
+        f"{context_block}\n\n"
+        "Write a detailed 4-part report with markdown bold section headers in this order: "
+        "**Emotional Arc**, **Context-Specific Interpretation**, **Actionable Guidance**, and "
+        "**Caution & Boundaries**.\n"
+        "Make each section specific to this session data and the selected report lens. "
         + (
             " Where relevant, connect the facial expressions to what was said in the transcript."
             if transcript else ""
@@ -738,6 +1076,7 @@ def _template_report(
     dominant_overall: str,
     history:          List[Tuple],
     transcript:       Optional[str] = None,
+    report_context:   Optional[Dict[str, str]] = None,
 ) -> str:
     """
     Deterministic template-based report — no API keys required.
@@ -748,9 +1087,11 @@ def _template_report(
     top    = sorted_emotions[0]
     second = next((e for e in sorted_emotions[1:] if e[1] > 5.0),  None)
     third  = next((e for e in sorted_emotions[2:] if e[1] > 3.0),  None)
+    context = report_context or _normalise_report_context(None)
 
     # — Paragraph 1: distribution overview ————————————————————————————————————
     p1 = (
+        "**Emotional Arc**\n"
         f"Throughout the {duration:.0f}-second session, your facial expressions were analysed "
         f"across {len(history)} video frames using DeepFace's pre-trained emotion model. "
         f"Your predominant emotion was **{top[0]}**, detected in {top[1]}% of the frames."
@@ -769,20 +1110,37 @@ def _template_report(
 
     if first_dom != second_dom:
         p2 = (
+            "**Context-Specific Interpretation**\n"
             f"The session showed a clear emotional arc: the first half was dominated by "
             f"**{first_dom}**, while the second half shifted toward **{second_dom}**. "
-            "Such transitions often reflect natural changes in engagement, comfort, or "
-            "response to evolving video content."
+            f"For the selected lens (**{context['label']}**), this suggests: {context['template_hint']}"
         )
     else:
         p2 = (
+            "**Context-Specific Interpretation**\n"
             f"Your emotional state remained consistently **{first_dom}** from beginning to end, "
-            "indicating a stable baseline throughout — typical of someone who is focused, "
-            "engaged, or at ease during the recording."
+            f"indicating a stable baseline. For the selected lens (**{context['label']}**), "
+            f"this supports: {context['template_hint']}"
         )
 
-    # — Paragraph 3: technical context ────────────────────────────────────────
+    switches = sum(
+        1 for idx in range(1, len(history)) if history[idx][1] != history[idx - 1][1]
+    )
+    stability = 100.0 if len(history) <= 1 else round((1 - switches / (len(history) - 1)) * 100, 1)
+
     p3 = (
+        "**Actionable Guidance**\n"
+        f"Objective: {context['objective']}. Emotional stability for this session was approximately "
+        f"{stability}% based on dominant-emotion transitions. "
+        f"Use this as a baseline and compare future runs for trend direction rather than one-off judgment."
+    )
+    if context.get("extra_notes"):
+        p3 += f" Additional notes considered: {context['extra_notes']}."
+
+    # — Paragraph 3: technical context ────────────────────────────────────────
+    p4 = (
+        "**Caution & Boundaries**\n"
+        f"{context['safety_note']} "
         "This analysis was performed using DeepFace with its mini_XCEPTION emotion model, "
         "which applies face detection, geometric alignment, and seven-class emotion "
         "classification to each video frame. A 3-second (15-frame) sliding window averages "
@@ -791,15 +1149,54 @@ def _template_report(
         "for all seven emotions — angry, disgust, fear, happy, neutral, sad, and surprise."
     )
 
-    paragraphs = [p1, p2]
+    paragraphs = [p1, p2, p3]
     if transcript:
         p_transcript = (
             f"**What you said:** \"{transcript}\"\n\n"
             "Your spoken words provide additional context for the facial expressions observed above."
         )
         paragraphs.append(p_transcript)
-    paragraphs.append(p3)
+    paragraphs.append(p4)
     return "\n\n".join(paragraphs)
+
+
+@app.get("/analysis/{analysis_id}")
+async def get_analysis_by_id(analysis_id: str, request: Request) -> dict:
+    """Fetch one persisted analysis report for the authenticated user."""
+    user = _extract_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if ANALYSIS_COLLECTION is None:
+        raise HTTPException(status_code=503, detail="Analysis storage unavailable")
+
+    try:
+        object_id = ObjectId(analysis_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid analysis id") from exc
+
+    doc = ANALYSIS_COLLECTION.find_one({"_id": object_id, "user_id": user["id"]})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return _serialise_analysis_doc(doc)
+
+
+@app.get("/analysis/by-session/{session_id}")
+async def get_analysis_by_session(session_id: str, request: Request, backend: Optional[str] = None) -> dict:
+    """Fetch the latest persisted analysis for a session and authenticated user."""
+    user = _extract_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if ANALYSIS_COLLECTION is None:
+        raise HTTPException(status_code=503, detail="Analysis storage unavailable")
+
+    query: Dict[str, Any] = {"session_id": session_id, "user_id": user["id"]}
+    if backend:
+        query["backend"] = backend
+
+    doc = ANALYSIS_COLLECTION.find_one(query, sort=[("ended_at", -1)])
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not ready")
+    return _serialise_analysis_doc(doc)
 
 
 # ── Health check ─────────────────────────────────────────────────────────────
@@ -813,6 +1210,7 @@ async def health() -> dict:
         "detector_backend":    DETECTOR_BACKEND,
         "classes":             CLASS_NAMES,
         "window_size":         WINDOW_SIZE,
+        "analysis_storage":    ANALYSIS_COLLECTION is not None,
         "audio_transcription": WHISPER_MODEL is not None,
         "whisper_model":       os.getenv("WHISPER_MODEL", "base") if WHISPER_MODEL else None,
     }
