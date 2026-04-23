@@ -543,32 +543,26 @@ def _smooth_window(
 
 # ── Audio transcription ─────────────────────────────────────────────────────────────
 
-def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
-    """
-    Concatenate accumulated audio chunks and transcribe with Whisper.
-
-    The chunks are raw bytes from MediaRecorder (WebM/Opus container).
-    Concatenating in order is valid: the first chunk carries the container
-    header; subsequent chunks are continuation data.  The assembled file is
-    written to a temp directory, transcribed, then immediately deleted.
-
-    Returns the transcript string, or None if Whisper is unavailable, no
-    audio was received, or transcription fails.  Never raises — failures are
-    logged and swallowed so report generation always succeeds.
-    """
-    if WHISPER_MODEL is None or not audio_chunks:
+def _transcribe_audio_blob(audio_blob: bytes) -> Optional[str]:
+    """Transcribe a single WebM/Opus blob with Whisper and return cleaned text."""
+    if WHISPER_MODEL is None or not audio_blob:
         return None
 
     tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
-            for chunk in audio_chunks:
-                f.write(chunk)
+            f.write(audio_blob)
             tmp_path = f.name
 
         # fp16=False avoids errors on CPU-only machines (fp16 requires CUDA)
-        result = WHISPER_MODEL.transcribe(tmp_path, fp16=False)
-        text = result.get("text", "").strip()
+        result = WHISPER_MODEL.transcribe(
+            tmp_path,
+            fp16=False,
+            task="transcribe",
+            temperature=0.0,
+            condition_on_previous_text=True,
+        )
+        text = " ".join(result.get("text", "").split()).strip()
         return text if text else None
 
     except Exception as exc:
@@ -580,6 +574,52 @@ def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _transcribe_audio(audio_chunks: List[bytes]) -> Optional[str]:
+    """
+    Transcribe session audio using two strategies and keep the richer result.
+
+    Strategy A: transcribe one concatenated blob (fastest when container joins cleanly).
+    Strategy B: transcribe each chunk independently, then concatenate texts.
+    The fallback catches cases where joined WebM chunks decode poorly.
+    """
+    if WHISPER_MODEL is None or not audio_chunks:
+        return None
+
+    merged_blob = b"".join(audio_chunks)
+    merged_text = _transcribe_audio_blob(merged_blob)
+
+    chunk_texts: List[str] = []
+    for chunk in audio_chunks:
+        # Skip tiny fragments that are usually silence or container edge noise.
+        if len(chunk) < 4096:
+            continue
+        chunk_text = _transcribe_audio_blob(chunk)
+        if chunk_text:
+            chunk_texts.append(chunk_text)
+
+    per_chunk_text = " ".join(chunk_texts).strip() if chunk_texts else None
+    candidates = [text for text in (merged_text, per_chunk_text) if text]
+    if not candidates:
+        return None
+
+    # Prefer the candidate with more lexical content.
+    best_text = max(candidates, key=lambda text: len(text.split()))
+
+    # Collapse adjacent duplicate tokens (common in low-confidence decoding).
+    words = best_text.split()
+    deduped: List[str] = []
+    prev_norm = ""
+    for word in words:
+        norm = word.lower().strip(".,!?;:")
+        if norm and norm == prev_norm:
+            continue
+        deduped.append(word)
+        prev_norm = norm
+
+    cleaned = " ".join(deduped).strip()
+    return cleaned if cleaned else None
 
 
 def _emotion_distribution_from_history(history: List[Tuple]) -> Dict[str, float]:
